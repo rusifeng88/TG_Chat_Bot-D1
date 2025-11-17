@@ -1,26 +1,26 @@
 /**
- * Telegram 双向机器人 Cloudflare Worker
- * 实现了：人机验证、私聊到话题模式的转发、管理员回复中继、话题名动态更新、已编辑消息处理、用户屏蔽功能、关键词自动回复
- * [修改] 存储已从 Cloudflare KV 切换到 D1 (SQLite) 以获取更高的写入容量。
- * [新增] 完整的管理员配置菜单，包括：验证配置、自动回复、关键词屏蔽和按类型过滤。
- * [修复] 修复了管理员配置输入后，用户状态未被正确标记为“已验证”，导致下一个消息流程出错的问题。
- * [新增] 在按类型过滤中增加了：所有转发消息、音频/语音、贴纸/GIF 的过滤开关。
- * [重构] 彻底重构了自动回复和关键词屏蔽的管理界面，引入了列表、新增、删除功能。
- * [新增] 完整的管理员配置菜单。
- * [新增] 备份群组功能：配置一个群组，用于接收所有用户消息的副本，不参与回复。
- * [新增] 协管员授权功能：允许设置额外的管理员ID，他们可以绕过私聊验证并回复用户消息。
- * [新增] 新增用户和管理员的消息发送回执功能。
- * [新增] 新增用户验证通过后，首条消息必须为纯文本的限制。
- * [修复漏洞] 修复了首次消息纯文本限制对链接等带实体的文本无效的问题。
- * [新增] 将管理员回复回执中的用户ID改为可点击的用户名。
- * [新增] 将用户资料卡中的用户名改为可点击跳转的链接。
- * * 部署要求: 
- * 1. D1 数据库绑定，名称必须为 'TG_BOT_DB'。
- * 2. 环境变量 ADMIN_IDS, BOT_TOKEN, ADMIN_GROUP_ID, 等不变。
+ * Telegram 双向机器人 Cloudflare Worker (D1 版本)
+ * * [集成 Cloudflare Turnstile]
+ * - 新增 Cloudflare Turnstile 作为第一道人机验证防线。
+ * - 机器人现在是一个路由器，处理:
+ * - POST / (或 /<BOT_TOKEN>): Telegram Webhook (原功能)
+ * - GET /verify: 提供给用户的 Turnstile 验证网页
+ * - POST /submit_token: 接收来自网页的 Turnstile 令牌并进行验证
+ * - 引入了新的用户状态 'pending_turnstile'。
+ * - 重写了 handleStart 和 handlePrivateMessage 的状态机逻辑。
+ * * [部署要求 - 新增]
+ * 3. 环境变量必须额外添加:
+ * - WORKER_URL: Worker 的完整 URL (例如 https://my-worker.example.workers.dev)
+ * - TURNSTILE_SITE_KEY: Cloudflare Turnstile 站点密钥
+ * - TURNSTILE_SECRET_KEY: Cloudflare Turnstile 密钥
  */
 
 
 // --- 辅助函数 (D1 数据库抽象层) ---
+// [此部分代码与您提供的版本完全相同，此处折叠以节省空间]
+// ... (dbConfigGet, dbConfigPut, dbUserGetOrCreate, dbUserUpdate, ...)
+// ... (dbTopicUserGet, dbMessageDataPut, dbMessageDataGet, ...)
+// ... (dbAdminStateDelete, dbAdminStateGet, dbAdminStatePut, dbMigrate)
 
 /**
  * [D1 Abstraction] 获取全局配置 (config table)
@@ -205,6 +205,10 @@ async function dbMigrate(env) {
 
 
 // --- 辅助函数 ---
+// [此部分代码与您提供的版本完全相同，此处折叠以节省空间]
+// ... (escapeHtml, getUserInfo, getInfoCardButtons, getConfig, ...)
+// ... (isPrimaryAdmin, getAuthorizedAdmins, isAdminUser, ...)
+// ... (getAutoReplyRules, getBlockKeywords, telegramApi)
 
 function escapeHtml(text) {
   if (!text) return '';
@@ -399,31 +403,272 @@ async function telegramApi(token, methodName, params = {}) {
 }
 
 
+// --- [新增] Cloudflare Turnstile 验证辅助函数 ---
+
+/**
+ * [新增] 验证 Turnstile 令牌
+ * @param {string} token - 来自客户端的 cf-turnstile-response 令牌
+ * @param {object} env - Worker 环境变量
+ */
+async function validateTurnstile(token, env) {
+    if (!token) {
+        return false;
+    }
+    if (!env.TURNSTILE_SECRET_KEY) {
+        console.error("Turnstile validation failed: TURNSTILE_SECRET_KEY is not set.");
+        return false;
+    }
+
+    try {
+        const response = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                secret: env.TURNSTILE_SECRET_KEY,
+                response: token,
+                // remoteip: request.headers.get('CF-Connecting-IP'), // 可选
+            }),
+        });
+
+        const data = await response.json();
+        return data.success === true;
+    } catch (e) {
+        console.error("Error validating Turnstile token:", e.message);
+        return false;
+    }
+}
+
+/**
+ * [新增] 处理对 /verify 路径的 GET 请求，返回 Turnstile 验证网页
+ */
+async function handleVerificationPage(request, env) {
+    const url = new URL(request.url);
+    const userId = url.searchParams.get('user_id');
+
+    if (!userId) {
+        return new Response("Missing user_id parameter.", { status: 400 });
+    }
+
+    if (!env.TURNSTILE_SITE_KEY) {
+        console.error("handleVerificationPage: TURNSTILE_SITE_KEY is not set.");
+        return new Response("Bot configuration error (missing site key).", { status: 500 });
+    }
+
+    const html = `
+    <!DOCTYPE html>
+    <html lang="zh-CN">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>人机验证</title>
+        <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
+        <style>
+            body { display: flex; flex-direction: column; justify-content: center; align-items: center; min-height: 100vh; font-family: sans-serif; background: #f4f4f4; color: #333; }
+            #container { background: #fff; padding: 2rem; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); text-align: center; }
+            h1 { margin-top: 0; }
+            #message { margin-top: 1.5rem; font-size: 1.1rem; font-weight: bold; }
+            #message.success { color: green; }
+            #message.error { color: red; }
+            .cf-turnstile { margin-top: 1.5rem; }
+        </style>
+    </head>
+    <body>
+        <div id="container">
+            <h1>请完成人机验证</h1>
+            <p>请点击下方的复选框以证明您是人类。</p>
+            
+            <div class="cf-turnstile" 
+                 data-sitekey="${env.TURNSTILE_SITE_KEY}" 
+                 data-callback="onTurnstileSuccess"
+                 data-expired-callback="onTurnstileExpired"
+                 data-error-callback="onTurnstileError">
+            </div>
+
+            <div id="message"></div>
+        </div>
+
+        <script>
+            const userId = "${userId}"; // 将 userId 嵌入到 JS
+            const messageEl = document.getElementById('message');
+
+            function onTurnstileSuccess(token) {
+                messageEl.textContent = '验证成功，正在提交...';
+                messageEl.className = '';
+
+                // 将令牌和 userId 发送到 Worker 的 /submit_token 端点
+                fetch('/submit_token', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ token: token, userId: userId })
+                })
+                .then(response => response.json())
+                .then(data => {
+                    if (data.success) {
+                        messageEl.textContent = '✅ 验证通过！您现在可以返回 Telegram 回答下一个问题了。';
+                        messageEl.className = 'success';
+                        // 验证成功后，可以尝试关闭窗口或提示用户返回
+                        setTimeout(() => {
+                           try { window.close(); } catch(e) { console.warn('Could not close window.'); }
+                        }, 3000);
+                    } else {
+                        messageEl.textContent = '❌ 令牌提交失败，请刷新页面重试。';
+                        messageEl.className = 'error';
+                    }
+                })
+                .catch(err => {
+                    console.error('Submit error:', err);
+                    messageEl.textContent = '❌ 验证提交时发生网络错误。';
+                    messageEl.className = 'error';
+                });
+            }
+            
+            function onTurnstileExpired() {
+                messageEl.textContent = '验证已过期，请重试。';
+                messageEl.className = 'error';
+            }
+            
+            function onTurnstileError() {
+                 messageEl.textContent = '验证加载失败，请刷新或检查网络。';
+                 messageEl.className = 'error';
+            }
+        </script>
+    </body>
+    </html>
+    `;
+
+    return new Response(html, {
+        headers: { "Content-Type": "text/html; charset=utf-8" },
+    });
+}
+
+/**
+ * [新增] 处理 /submit_token 路径的 POST 请求，验证 Turnstile 令牌
+ */
+async function handleSubmitToken(request, env) {
+    try {
+        const { token, userId } = await request.json();
+
+        if (!token || !userId) {
+            return new Response(JSON.stringify({ success: false, error: "Missing token or userId" }), {
+                status: 400,
+                headers: { 'Content-Type': 'application/json' }
+            });
+        }
+
+        // 1. 验证 Turnstile 令牌
+        const isValid = await validateTurnstile(token, env);
+
+        if (!isValid) {
+            return new Response(JSON.stringify({ success: false, error: "Invalid Turnstile token" }), {
+                status: 403,
+                headers: { 'Content-Type': 'application/json' }
+            });
+        }
+
+        // 2. 验证通过，更新 D1 状态
+        // 将状态从 'pending_turnstile' 更新为 'pending_verification' (等待L2问题答案)
+        await dbUserUpdate(userId, { user_state: "pending_verification" }, env);
+
+        // 3. [关键] 主动向用户发送 L2 验证问题
+        const defaultVerifQ = "问题：1+1=?\n\n提示：\n1. 正确答案不是“2”。\n2. 答案在机器人简介内，请看简介的答案进行回答。";
+        const verificationQuestion = await getConfig('verif_q', env, defaultVerifQ);
+        
+        await telegramApi(env.BOT_TOKEN, "sendMessage", {
+            chat_id: userId,
+            text: "✅ Cloudflare 验证通过！\n\n现在请回答第二道防线问题（在简介中找到答案）："
+        });
+        await telegramApi(env.BOT_TOKEN, "sendMessage", {
+            chat_id: userId,
+            text: verificationQuestion
+        });
+
+        // 4. 向网页返回成功响应
+        return new Response(JSON.stringify({ success: true }), {
+            headers: { 'Content-Type': 'application/json' }
+        });
+
+    } catch (e) {
+        console.error("handleSubmitToken error:", e.message);
+        return new Response(JSON.stringify({ success: false, error: e.message }), {
+            status: 500,
+            headers: { 'Content-Type': 'application/json' }
+        });
+    }
+}
+
+
 // --- 核心更新处理函数 ---
 
+/**
+ * [修改] Worker 入口：重构为路由器
+ * 1. 运行 D1 迁移
+ * 2. 检查 Turnstile 环境变量
+ * 3. 路由请求:
+ * - GET /verify -> handleVerificationPage()
+ * - POST /submit_token -> handleSubmitToken()
+ * - POST / (或 /<TOKEN>) -> handleUpdate() (Telegram Webhook)
+ */
 export default {
   async fetch(request, env, ctx) {
-      // 关键修正：在处理任何请求之前，先运行数据库迁移，确保表结构存在。
+      // 1. 运行 D1 迁移
       try {
             await dbMigrate(env);
       } catch (e) {
-            // 如果迁移失败，直接返回错误，防止后续 D1 调用失败
             return new Response(`D1 Database Initialization Error: ${e.message}`, { status: 500 });
       }
 
-      if (request.method === "POST") {
-          try {
-              const update = await request.json();
-              // 使用 ctx.waitUntil 确保异步处理不会被 Worker 提前终止
-              ctx.waitUntil(handleUpdate(update, env)); 
-          } catch (e) {
-              console.error("处理更新时出错:", e);
-          }
+      // 2. 检查 Turnstile 环境变量
+      if (!env.TURNSTILE_SECRET_KEY || !env.TURNSTILE_SITE_KEY || !env.WORKER_URL) {
+          console.error("CRITICAL: Missing TURNSTILE_SECRET_KEY, TURNSTILE_SITE_KEY, or WORKER_URL environment variables.");
+          // 注意：如果环境变量缺失，Turnstile 验证流程将失败
       }
-      return new Response("OK");
+      
+      const url = new URL(request.url);
+
+      // 3. 路由
+      try {
+          // 路由 A: 网页验证页面 (GET /verify?user_id=...)
+          if (request.method === "GET" && url.pathname === "/verify") {
+              return handleVerificationPage(request, env);
+          }
+          
+          // 路由 B: 网页提交 Turnstile 令牌 (POST /submit_token)
+          if (request.method === "POST" && url.pathname === "/submit_token") {
+              return handleSubmitToken(request, env);
+          }
+
+          // 路由 C: Telegram Webhook (POST /)
+          // 假设 webhook 设置在根目录 "/" 或 包含 Token 的路径
+          if (request.method === "POST") {
+              try {
+                  const update = await request.json();
+                  ctx.waitUntil(handleUpdate(update, env)); // 异步处理 Webhook
+                  return new Response("OK"); // 立即响应 Telegram
+              } catch (e) {
+                  console.error("Failed to parse Telegram update:", e);
+                  return new Response("Invalid JSON", { status: 400 });
+              }
+          }
+
+          // 兜底 GET /
+          if (request.method === "GET" && url.pathname === "/") {
+               return new Response("Telegram Bot Worker is running. Use /verify for Turnstile verification.", { status: 200 });
+          }
+
+          return new Response("Not found.", { status: 404 });
+
+      } catch (e) {
+          console.error("Fetch handler error:", e);
+          return new Response("Internal Server Error", { status: 500 });
+      }
   },
 };
 
+/**
+ * 处理 Telegram 的 Webhook 更新 (由 fetch 路由器调用)
+ */
 async function handleUpdate(update, env) {
     if (update.message) {
         if (update.message.chat.type === "private") {
@@ -441,6 +686,9 @@ async function handleUpdate(update, env) {
     } 
 }
 
+/**
+ * [修改] 处理私聊消息 (状态机重构)
+ */
 async function handlePrivateMessage(message, env) {
     const chatId = message.chat.id.toString();
     const text = message.text || "";
@@ -456,6 +704,7 @@ async function handlePrivateMessage(message, env) {
         if (isPrimary) { // 只有主管理员能访问配置菜单
             await handleAdminConfigStart(chatId, env);
         } else {
+            // [MODIFIED] 调用新的 handleStart 逻辑，它会处理 L1 和 L2 验证
             await handleStart(chatId, env);
         }
         return;
@@ -469,7 +718,7 @@ async function handlePrivateMessage(message, env) {
         return; 
     }
     
-    // 主管理员在配置编辑状态中发送的文本输入
+    // 主管理员在配置编辑状态中发送的文本输入 (此逻辑块保持不变)
     if (isPrimary) {
         const adminStateJson = await dbAdminStateGet(userId, env);
         if (adminStateJson) {
@@ -477,28 +726,52 @@ async function handlePrivateMessage(message, env) {
             return;
         }
         
-        // --- 核心修复: 确保主管理员用户跳过验证 ---
         if (user.user_state !== "verified") {
-            // 更新本地 user 对象和 D1 数据库
             user.user_state = "verified"; 
             await dbUserUpdate(userId, { user_state: "verified" }, env); 
         }
-        // --- 修复结束 ---
     }
     
-    // --- 协管员绕过验证逻辑 ---
+    // 协管员绕过验证逻辑 (此逻辑块保持不变)
     if (isAdmin && user.user_state !== "verified") {
         user.user_state = "verified"; 
         await dbUserUpdate(userId, { user_state: "verified" }, env); 
     }
-    // --- 协管员绕过验证逻辑结束 ---
 
     // 2. 检查用户的验证状态
+    // [MODIFIED] 新的验证状态机
     const userState = user.user_state;
 
-    if (userState === "pending_verification") {
+    if (userState === "new" || userState === "pending_turnstile") {
+        // 用户未通过L1验证，且发送的不是 /start
+        // 提示他们使用 /start 或点击按钮
+        
+        if (userState === "pending_turnstile" && env.WORKER_URL) {
+            // 友好地重新发送按钮
+            const workerUrl = env.WORKER_URL.replace(/\/$/, '');
+            const verificationUrl = `${workerUrl}/verify?user_id=${chatId}`;
+            const keyboard = { inline_keyboard: [[{ text: "➡️ 点击进行人机验证", url: verificationUrl }]] };
+            await telegramApi(env.BOT_TOKEN, "sendMessage", { 
+                chat_id: chatId, 
+                text: "请先点击按钮完成第一道 Cloudflare 人机验证。", 
+                reply_markup: keyboard 
+            });
+        } else {
+             // 状态为 'new' 或 环境变量缺失
+             await telegramApi(env.BOT_TOKEN, "sendMessage", { 
+                 chat_id: chatId, 
+                 text: "请使用 /start 命令开始验证流程。" 
+             });
+        }
+        return; // 阻止后续操作
+
+    } else if (userState === "pending_verification") {
+        // 用户已通过L1，正在回答L2问题
         await handleVerification(chatId, text, env);
+        return; // 阻止后续操作
+    
     } else if (userState === "verified") {
+        // [UNCHANGED] 已验证通过，进入原有的转发逻辑
         
         // --- 首次消息纯文本检查 ---
         if (!user.first_message_sent) { 
@@ -682,40 +955,79 @@ async function handlePrivateMessage(message, env) {
         await handleRelayToTopic(message, user, env); // 传递 user 对象
         
     } else {
+        // 兜底状态，理论上不应到达
         await telegramApi(env.BOT_TOKEN, "sendMessage", {
             chat_id: chatId,
-            text: "请使用 /start 命令开始。",
+            text: "您的状态异常，请使用 /start 命令重试。",
         });
     }
 }
 
 // --- 验证逻辑 (使用 D1) ---
 
+/**
+ * [修改] L1 (Turnstile) 和 L2 (问题) 验证流程的入口
+ * 此函数现在处理 /start 命令，并根据用户当前状态引导他们
+ */
 async function handleStart(chatId, env) {
-    const welcomeMessage = await getConfig('welcome_msg', env, "欢迎！在使用之前，请先完成人机验证。");
+    const user = await dbUserGetOrCreate(chatId, env);
     
-    const defaultVerificationQuestion = 
-        "问题：1+1=?\n\n" +
-        "提示：\n" +
-        "1. 正确答案不是“2”。\n" +
-        "2. 答案在机器人简介内，请看简介的答案进行回答。";
-        
-    const verificationQuestion = await getConfig('verif_q', env, defaultVerificationQuestion);
+    // 检查 Turnstile 必需的环境变量
+    if (!env.WORKER_URL || !env.TURNSTILE_SITE_KEY) {
+        await telegramApi(env.BOT_TOKEN, "sendMessage", { chat_id: chatId, text: "⚠️ 机器人配置错误：Cloudflare Turnstile 未正确配置。请联系管理员。" });
+        console.error("handleStart: Missing WORKER_URL or TURNSTILE_SITE_KEY");
+        return;
+    }
 
-    await telegramApi(env.BOT_TOKEN, "sendMessage", { chat_id: chatId, text: welcomeMessage });
-    await telegramApi(env.BOT_TOKEN, "sendMessage", { chat_id: chatId, text: verificationQuestion });
-    
-    // 更新 D1 中的用户状态
-    await dbUserUpdate(chatId, { user_state: "pending_verification" }, env);
+    // 根据用户状态决定操作
+    switch (user.user_state) {
+        case 'new':
+        case 'pending_turnstile':
+            // 状态为 'new' 或 'pending_turnstile'，发送L1验证
+            const workerUrl = env.WORKER_URL.replace(/\/$/, ''); // 移除末尾斜杠
+            const verificationUrl = `${workerUrl}/verify?user_id=${chatId}`;
+            const welcomeMessage = await getConfig('welcome_msg', env, "欢迎！在使用之前，请先完成人机验证。");
+
+            const text = welcomeMessage + "\n\n请点击下方按钮，完成第一道 Cloudflare 人机验证。";
+            const keyboard = { inline_keyboard: [[{ text: "➡️ 点击进行人机验证", url: verificationUrl }]] };
+
+            await telegramApi(env.BOT_TOKEN, "sendMessage", {
+                chat_id: chatId,
+                text: text,
+                reply_markup: keyboard
+            });
+            
+            // 更新状态
+            if (user.user_state === 'new') {
+                 await dbUserUpdate(chatId, { user_state: "pending_turnstile" }, env);
+            }
+            break;
+        
+        case 'pending_verification':
+            // 已通过L1，等待L2答案，重新发送L2问题
+            const defaultVerifQ = "问题：1+1=?\n\n提示：\n1. 正确答案不是“2”。\n2. 答案在机器人简介内，请看简介的答案进行回答。";
+            const verificationQuestion = await getConfig('verif_q', env, defaultVerifQ);
+            
+            await telegramApi(env.BOT_TOKEN, "sendMessage", { chat_id: chatId, text: "您已通过第一道验证。请回答以下第二道问题：\n\n" + verificationQuestion });
+            break;
+
+        case 'verified':
+            // 已完全验证
+            await telegramApi(env.BOT_TOKEN, "sendMessage", { chat_id: chatId, text: "您已通过验证，可以正常发送消息。" });
+            break;
+    }
 }
 
+/**
+ * [未修改] L2 验证：处理问题答案
+ */
 async function handleVerification(chatId, answer, env) {
     const expectedAnswer = await getConfig('verif_a', env, "3"); 
 
     if (answer.trim() === expectedAnswer.trim()) {
         await telegramApi(env.BOT_TOKEN, "sendMessage", {
             chat_id: chatId,
-            text: "✅ 验证通过！您现在可以发送消息了。\n\n**注意：您的第一条消息必须是纯文本内容。**",
+            text: "✅ L2 验证通过！您现在可以发送消息了。\n\n**注意：您的第一条消息必须是纯文本内容。**",
             parse_mode: "Markdown",
         });
         // 更新 D1 中的用户状态, first_message_sent 保持默认的 0/false
@@ -723,12 +1035,18 @@ async function handleVerification(chatId, answer, env) {
     } else {
         await telegramApi(env.BOT_TOKEN, "sendMessage", {
             chat_id: chatId,
-            text: "❌ 验证失败！\n请查看机器人简介查找答案，然后重新回答。",
+            text: "❌ L2 验证失败！\n请查看机器人简介查找答案，然后重新回答。",
         });
     }
 }
 
 // --- 管理员配置主菜单逻辑 (使用 D1) ---
+// [此部分代码与您提供的版本完全相同，此处折叠以节省空间]
+// ... (handleAdminConfigStart, handleAdminBaseConfigMenu, handleAdminAuthorizedConfigMenu, ...)
+// ... (handleAdminAutoReplyMenu, handleAdminKeywordBlockMenu, handleAdminBackupConfigMenu, ...)
+// ... (handleAdminRuleList, handleAdminRuleDelete, handleAdminTypeBlockMenu, handleAdminConfigInput, ...)
+// ... (handleRelayToTopic, handleRelayEditedMessage, handlePinCard, ...)
+// ... (handleCallbackQuery, handleBlockUser, handleUnblockUser, handleAdminReply)
 
 async function handleAdminConfigStart(chatId, env) {
     const isPrimary = isPrimaryAdmin(chatId, env);
