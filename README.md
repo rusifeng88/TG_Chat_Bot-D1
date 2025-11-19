@@ -1,4 +1,4 @@
-# 🚀 Telegram 双向机器人 Cloudflare Worker (v3.25 终极增强版)
+# 🚀 Telegram 双向机器人 Cloudflare Worker (v3.27 终极增强版)
 
 ## 📖 项目简介
 
