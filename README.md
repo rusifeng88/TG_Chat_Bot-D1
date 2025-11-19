@@ -54,8 +54,8 @@
 
 *   Cloudflare 账号。
 *   Telegram Bot Token (通过 @BotFather 获取)。
-*   Telegram 管理员群组 ID (必须是开启了话题功能的超级群组，ID 以 -100 开头)。
-*   管理员 ID (你自己的 TG ID，通过 @userinfobot 获取)。
+*   Telegram 管理员群组 ID (必须是开启了话题功能的超级群组，ID 以 -100 开头，通过 @raw_data_bot 获取)。
+*   管理员 ID (你自己的 TG ID，通过 @raw_data_bot 获取)。
 
 ### 步骤一：创建 D1 数据库
 
